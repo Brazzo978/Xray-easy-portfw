@@ -270,6 +270,9 @@ PostUp = iptables -C INPUT -p udp --dport $WG_PORT -j ACCEPT 2>/dev/null || ipta
 PostUp = iptables -C FORWARD -i $WG_NAME -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $WG_NAME -j ACCEPT
 PostUp = iptables -C FORWARD -o $WG_NAME -j ACCEPT 2>/dev/null || iptables -I FORWARD -o $WG_NAME -j ACCEPT
 PostUp = iptables -t nat -C POSTROUTING -o $WG_NAME -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $WG_NAME -j MASQUERADE
+PostUp = iptables -C FORWARD -i $WG_NAME -o $public_if -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $WG_NAME -o $public_if -j ACCEPT
+PostUp = iptables -C FORWARD -i $public_if -o $WG_NAME -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD -i $public_if -o $WG_NAME -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -t nat -C POSTROUTING -o $public_if -s 10.200.0.0/30 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $public_if -s 10.200.0.0/30 -j MASQUERADE
 PostUp = iptables -t nat -C PREROUTING -i $public_if -p tcp --dport 1:442 -j DNAT --to-destination 10.200.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i $public_if -p tcp --dport 1:442 -j DNAT --to-destination 10.200.0.2
 PostUp = iptables -t nat -C PREROUTING -i $public_if -p tcp --dport 444:65521 -j DNAT --to-destination 10.200.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i $public_if -p tcp --dport 444:65521 -j DNAT --to-destination 10.200.0.2
 PostUp = iptables -t nat -C PREROUTING -i $public_if -p tcp --dport 65524:65535 -j DNAT --to-destination 10.200.0.2 2>/dev/null || iptables -t nat -A PREROUTING -i $public_if -p tcp --dport 65524:65535 -j DNAT --to-destination 10.200.0.2
@@ -280,6 +283,9 @@ PostDown = iptables -D INPUT -p udp --dport $WG_PORT -j ACCEPT 2>/dev/null || tr
 PostDown = iptables -D FORWARD -i $WG_NAME -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D FORWARD -o $WG_NAME -j ACCEPT 2>/dev/null || true
 PostDown = iptables -t nat -D POSTROUTING -o $WG_NAME -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i $WG_NAME -o $public_if -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i $public_if -o $WG_NAME -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -o $public_if -s 10.200.0.0/30 -j MASQUERADE 2>/dev/null || true
 PostDown = iptables -t nat -D PREROUTING -i $public_if -p tcp --dport 1:442 -j DNAT --to-destination 10.200.0.2 2>/dev/null || true
 PostDown = iptables -t nat -D PREROUTING -i $public_if -p tcp --dport 444:65521 -j DNAT --to-destination 10.200.0.2 2>/dev/null || true
 PostDown = iptables -t nat -D PREROUTING -i $public_if -p tcp --dport 65524:65535 -j DNAT --to-destination 10.200.0.2 2>/dev/null || true
@@ -305,6 +311,7 @@ generate_gl_wg_client_conf() {
 Address = $WG_CLIENT_IP
 PrivateKey = $WG_CLIENT_PRIVKEY
 MTU = $WG_MTU
+DNS = 1.1.1.1, 1.0.0.1
 
 [Peer]
 PublicKey = $WG_SERVER_PUBKEY
@@ -332,6 +339,20 @@ STATE_DIR="/etc/xray-client-bundle"
 STATE_FILE="\$STATE_DIR/state.env"
 WATCHDOG_SCRIPT="/root/xray_watchdog.sh"
 WATCHDOG_INIT="/etc/init.d/xray-watchdog"
+UDP_PROXY_ENABLED="0"
+WG_UDPICMP_ENABLED="0"
+
+ask_yes_no_default_no() {
+  prompt="\$1"
+  ans=""
+  printf "%s [s/N]: " "\$prompt"
+  read -r ans || true
+  ans_lc="\$(printf '%s' "\$ans" | tr '[:upper:]' '[:lower:]')"
+  case "\$ans_lc" in
+    s|si|y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 save_state() {
   mkdir -p "\$STATE_DIR"
@@ -340,6 +361,8 @@ INSTALLED=1
 SERVER_ENDPOINT="\$SERVER_ENDPOINT"
 SERVER_PORT="\$SERVER_PORT"
 UUID="\$UUID"
+UDP_PROXY_ENABLED="\$UDP_PROXY_ENABLED"
+WG_UDPICMP_ENABLED="\$WG_UDPICMP_ENABLED"
 EOT
   chmod 600 "\$STATE_FILE"
 }
@@ -438,9 +461,9 @@ write_firewall_user() {
 VPS_IP="__VPS_IP__"
 LAN_IF="br-lan"
 TPORT="12345"
-
-ip rule add fwmark 1 table 100 2>/dev/null
-ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+UDP_PROXY_ENABLED="__UDP_PROXY_ENABLED__"
+WG_UDPICMP_ENABLED="__WG_UDPICMP_ENABLED__"
+WG_MARK="0x200000/0x200000"
 
 iptables -t nat -N XRAY 2>/dev/null
 iptables -t nat -F XRAY
@@ -453,18 +476,50 @@ iptables -t nat -A XRAY -p tcp -j REDIRECT --to-ports "\$TPORT"
 iptables -t nat -D PREROUTING -i "\$LAN_IF" -p tcp -j XRAY 2>/dev/null
 iptables -t nat -A PREROUTING -i "\$LAN_IF" -p tcp -j XRAY
 
-iptables -t mangle -N XRAY_MASK 2>/dev/null
-iptables -t mangle -F XRAY_MASK
-for NET in \
-  0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
-  172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 "\$VPS_IP"/32; do
-  iptables -t mangle -A XRAY_MASK -d "\$NET" -j RETURN
-done
-iptables -t mangle -A XRAY_MASK -p udp -j TPROXY --on-port "\$TPORT" --tproxy-mark 0x1/0x1
-iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK 2>/dev/null
-iptables -t mangle -A PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK
+iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK 2>/dev/null || true
+iptables -t mangle -F XRAY_MASK 2>/dev/null || true
+iptables -t mangle -X XRAY_MASK 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j WG_UDPICMP 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p icmp -j WG_UDPICMP 2>/dev/null || true
+iptables -t mangle -F WG_UDPICMP 2>/dev/null || true
+iptables -t mangle -X WG_UDPICMP 2>/dev/null || true
+ip rule del fwmark 1 table 100 2>/dev/null || true
+ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null || true
+ip route flush table 100 2>/dev/null || true
+
+if [ "\$UDP_PROXY_ENABLED" = "1" ]; then
+  ip rule add fwmark 1 table 100 2>/dev/null
+  ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+
+  iptables -t mangle -N XRAY_MASK 2>/dev/null
+  iptables -t mangle -F XRAY_MASK
+  for NET in \
+    0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+    172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 "\$VPS_IP"/32; do
+    iptables -t mangle -A XRAY_MASK -d "\$NET" -j RETURN
+  done
+  iptables -t mangle -A XRAY_MASK -p udp -j TPROXY --on-port "\$TPORT" --tproxy-mark 0x1/0x1
+  iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK 2>/dev/null
+  iptables -t mangle -A PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK
+elif [ "\$WG_UDPICMP_ENABLED" = "1" ]; then
+  iptables -t mangle -N WG_UDPICMP 2>/dev/null
+  iptables -t mangle -F WG_UDPICMP
+  for NET in \
+    0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+    172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 "\$VPS_IP"/32; do
+    iptables -t mangle -A WG_UDPICMP -d "\$NET" -j RETURN
+  done
+  iptables -t mangle -A WG_UDPICMP -p udp -j MARK --set-xmark "\$WG_MARK"
+  iptables -t mangle -A WG_UDPICMP -p icmp -j MARK --set-xmark "\$WG_MARK"
+  iptables -t mangle -I PREROUTING 3 -i "\$LAN_IF" -p udp -j WG_UDPICMP
+  iptables -t mangle -I PREROUTING 4 -i "\$LAN_IF" -p icmp -j WG_UDPICMP
+  ip rule add fwmark 0x200000/0x200000 table 100 pref 1005
+  ip route add default dev wgclient table 100
+fi
 FW
   sed -i "s#__VPS_IP__#\$SERVER_ENDPOINT#g" /etc/firewall.user
+  sed -i "s#__UDP_PROXY_ENABLED__#\$UDP_PROXY_ENABLED#g" /etc/firewall.user
+  sed -i "s#__WG_UDPICMP_ENABLED__#\$WG_UDPICMP_ENABLED#g" /etc/firewall.user
   chmod 700 /etc/firewall.user
 }
 
@@ -488,8 +543,7 @@ log() {
 }
 
 proxy_rules_present() {
-  iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -p tcp -j XRAY" && \
-  iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -p udp -j XRAY_MASK"
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -p tcp -j XRAY"
 }
 
 enable_proxy_rules() {
@@ -594,11 +648,16 @@ xray_start_safe() {
 clear_transparent_rules() {
   iptables -t nat -D PREROUTING -i br-lan -p tcp -j XRAY 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i br-lan -p udp -j XRAY_MASK 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i br-lan -p udp -j WG_UDPICMP 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i br-lan -p icmp -j WG_UDPICMP 2>/dev/null || true
   iptables -t nat -F XRAY 2>/dev/null || true
   iptables -t nat -X XRAY 2>/dev/null || true
   iptables -t mangle -F XRAY_MASK 2>/dev/null || true
   iptables -t mangle -X XRAY_MASK 2>/dev/null || true
+  iptables -t mangle -F WG_UDPICMP 2>/dev/null || true
+  iptables -t mangle -X WG_UDPICMP 2>/dev/null || true
   ip rule del fwmark 1 table 100 2>/dev/null || true
+  ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null || true
   ip route flush table 100 2>/dev/null || true
 }
 
@@ -641,10 +700,20 @@ show_status() {
   else
     echo "transparent tcp: OFF"
   fi
-  if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i br-lan -p udp -j XRAY_MASK"; then
-    echo "transparent udp: ON"
+  if [ "\${UDP_PROXY_ENABLED:-0}" = "1" ]; then
+    if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i br-lan -p udp -j XRAY_MASK"; then
+      echo "transparent udp: ON"
+    else
+      echo "transparent udp: OFF"
+    fi
+  elif [ "\${WG_UDPICMP_ENABLED:-0}" = "1" ]; then
+    if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i br-lan -p udp -j WG_UDPICMP"; then
+      echo "udp/icmp via wg: ON"
+    else
+      echo "udp/icmp via wg: OFF"
+    fi
   else
-    echo "transparent udp: OFF"
+    echo "transparent udp: OFF (direct)"
   fi
   if [ -x "\$WATCHDOG_INIT" ]; then
     echo "watchdog: $(/etc/init.d/xray-watchdog status 2>/dev/null || echo unknown)"
@@ -656,6 +725,17 @@ show_status() {
 }
 
 install_mode() {
+  if ask_yes_no_default_no "Vuoi attivare anche UDP over Xray"; then
+    UDP_PROXY_ENABLED="1"
+    WG_UDPICMP_ENABLED="0"
+  else
+    UDP_PROXY_ENABLED="0"
+    if ask_yes_no_default_no "Vuoi instradare UDP e ICMP nel tunnel WireGuard"; then
+      WG_UDPICMP_ENABLED="1"
+    else
+      WG_UDPICMP_ENABLED="0"
+    fi
+  fi
   opkg update
   opkg install xray-core xray-geodata ca-bundle curl
   write_xray_config
