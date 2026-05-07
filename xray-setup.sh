@@ -37,6 +37,20 @@ ask_yes_no() {
   done
 }
 
+ask_yes_no_default_yes() {
+  local prompt="$1"
+  local ans
+  read -r -p "$prompt [S/n]: " ans
+  case "${ans,,}" in
+    ""|s|si|y|yes) return 0 ;;
+    n|no) return 1 ;;
+    *)
+      echo "Rispondi s o n."
+      ask_yes_no_default_yes "$prompt"
+      ;;
+  esac
+}
+
 save_state() {
   local server_endpoint="$1"
   local uuid="$2"
@@ -145,7 +159,7 @@ configure_ssh_port_optional() {
 }
 
 install_custom_kernel_optional() {
-  if ! ask_yes_no "Vuoi configurare il kernel modificato per best performance"; then
+  if ! ask_yes_no_default_yes "Vuoi configurare il kernel modificato per best performance (consigliato; scegli no solo se la VPS non lo supporta o crea problemi)"; then
     return
   fi
 
@@ -316,7 +330,7 @@ DNS = 1.1.1.1, 1.0.0.1
 [Peer]
 PublicKey = $WG_SERVER_PUBKEY
 Endpoint = ${server_endpoint}:${WG_PORT}
-AllowedIPs = 10.200.0.1/32
+AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = $WG_KEEPALIVE
 EOF
 
@@ -337,18 +351,18 @@ UUID="$uuid"
 
 STATE_DIR="/etc/xray-client-bundle"
 STATE_FILE="\$STATE_DIR/state.env"
+FORCE_WG_LIST="\$STATE_DIR/force_wg.list"
 WATCHDOG_SCRIPT="/root/xray_watchdog.sh"
 WATCHDOG_INIT="/etc/init.d/xray-watchdog"
 UDP_PROXY_ENABLED="0"
 WG_UDPICMP_ENABLED="0"
 
 ask_yes_no_default_no() {
-  prompt="\$1"
-  ans=""
-  printf "%s [s/N]: " "\$prompt"
-  read -r ans || true
-  ans_lc="\$(printf '%s' "\$ans" | tr '[:upper:]' '[:lower:]')"
-  case "\$ans_lc" in
+  local prompt="\$1"
+  local ans
+  read -r -p "\$prompt [s/N]: " ans || true
+  ans="\$(printf '%s' "\$ans" | tr '[:upper:]' '[:lower:]')"
+  case "\$ans" in
     s|si|y|yes) return 0 ;;
     *) return 1 ;;
   esac
@@ -455,6 +469,26 @@ config config 'config'
 UCIEOF
 }
 
+ensure_wg_peer_allowed_ips() {
+  local wg_if="wgclient"
+  local peer config
+
+  if command -v wg >/dev/null 2>&1 && wg show "\$wg_if" >/dev/null 2>&1; then
+    for peer in \$(wg show "\$wg_if" peers 2>/dev/null); do
+      wg set "\$wg_if" peer "\$peer" allowed-ips 0.0.0.0/0 2>/dev/null || true
+    done
+  fi
+
+  if command -v uci >/dev/null 2>&1; then
+    config="\$(uci -q get network.\$wg_if.config || true)"
+    if [ -n "\$config" ]; then
+      uci -q set wireguard."\$config".allowed_ips='0.0.0.0/0' || true
+      uci -q set wireguard."\$config".route_allowed_ips='0' || true
+      uci -q commit wireguard || true
+    fi
+  fi
+}
+
 write_firewall_user() {
   cat >/etc/firewall.user <<'FW'
 #!/bin/sh
@@ -463,10 +497,20 @@ LAN_IF="br-lan"
 TPORT="12345"
 UDP_PROXY_ENABLED="__UDP_PROXY_ENABLED__"
 WG_UDPICMP_ENABLED="__WG_UDPICMP_ENABLED__"
+FORCE_WG_LIST="__FORCE_WG_LIST__"
 WG_MARK="0x200000/0x200000"
+WG_TABLE="101"
 
 iptables -t nat -N XRAY 2>/dev/null
 iptables -t nat -F XRAY
+FORCE_WG_ACTIVE=0
+if [ -s "\$FORCE_WG_LIST" ]; then
+  while IFS= read -r NET; do
+    case "\$NET" in ""|\#*) continue ;; esac
+    iptables -t nat -A XRAY -d "\$NET" -j RETURN
+    FORCE_WG_ACTIVE=1
+  done < "\$FORCE_WG_LIST"
+fi
 for NET in \
   0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
   172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 "\$VPS_IP"/32; do
@@ -476,16 +520,33 @@ iptables -t nat -A XRAY -p tcp -j REDIRECT --to-ports "\$TPORT"
 iptables -t nat -D PREROUTING -i "\$LAN_IF" -p tcp -j XRAY 2>/dev/null
 iptables -t nat -A PREROUTING -i "\$LAN_IF" -p tcp -j XRAY
 
+iptables -t mangle -D PREROUTING -i "\$LAN_IF" -j WG_FORCE 2>/dev/null || true
 iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j XRAY_MASK 2>/dev/null || true
 iptables -t mangle -F XRAY_MASK 2>/dev/null || true
 iptables -t mangle -X XRAY_MASK 2>/dev/null || true
 iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p udp -j WG_UDPICMP 2>/dev/null || true
 iptables -t mangle -D PREROUTING -i "\$LAN_IF" -p icmp -j WG_UDPICMP 2>/dev/null || true
+iptables -t mangle -F WG_FORCE 2>/dev/null || true
+iptables -t mangle -X WG_FORCE 2>/dev/null || true
 iptables -t mangle -F WG_UDPICMP 2>/dev/null || true
 iptables -t mangle -X WG_UDPICMP 2>/dev/null || true
-ip rule del fwmark 1 table 100 2>/dev/null || true
-ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null || true
+while ip rule del fwmark 1 table 100 2>/dev/null; do :; done
+while ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null; do :; done
+while ip rule del fwmark 0x200000/0x200000 table "\$WG_TABLE" 2>/dev/null; do :; done
 ip route flush table 100 2>/dev/null || true
+ip route flush table "\$WG_TABLE" 2>/dev/null || true
+
+if [ "\$FORCE_WG_ACTIVE" = "1" ]; then
+  iptables -t mangle -N WG_FORCE 2>/dev/null
+  iptables -t mangle -F WG_FORCE
+  while IFS= read -r NET; do
+    case "\$NET" in ""|\#*) continue ;; esac
+    iptables -t mangle -A WG_FORCE -d "\$NET" -j MARK --set-xmark "\$WG_MARK"
+  done < "\$FORCE_WG_LIST"
+  iptables -t mangle -I PREROUTING 1 -i "\$LAN_IF" -j WG_FORCE
+  ip rule show | grep -q "fwmark 0x200000/0x200000 lookup \$WG_TABLE" || ip rule add fwmark 0x200000/0x200000 table "\$WG_TABLE" pref 1005 2>/dev/null || true
+  ip route add default dev wgclient table "\$WG_TABLE" 2>/dev/null || true
+fi
 
 if [ "\$UDP_PROXY_ENABLED" = "1" ]; then
   ip rule add fwmark 1 table 100 2>/dev/null
@@ -493,6 +554,12 @@ if [ "\$UDP_PROXY_ENABLED" = "1" ]; then
 
   iptables -t mangle -N XRAY_MASK 2>/dev/null
   iptables -t mangle -F XRAY_MASK
+  if [ "\$FORCE_WG_ACTIVE" = "1" ]; then
+    while IFS= read -r NET; do
+      case "\$NET" in ""|\#*) continue ;; esac
+      iptables -t mangle -A XRAY_MASK -d "\$NET" -j RETURN
+    done < "\$FORCE_WG_LIST"
+  fi
   for NET in \
     0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
     172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 "\$VPS_IP"/32; do
@@ -513,13 +580,14 @@ elif [ "\$WG_UDPICMP_ENABLED" = "1" ]; then
   iptables -t mangle -A WG_UDPICMP -p icmp -j MARK --set-xmark "\$WG_MARK"
   iptables -t mangle -I PREROUTING 3 -i "\$LAN_IF" -p udp -j WG_UDPICMP
   iptables -t mangle -I PREROUTING 4 -i "\$LAN_IF" -p icmp -j WG_UDPICMP
-  ip rule add fwmark 0x200000/0x200000 table 100 pref 1005
-  ip route add default dev wgclient table 100
+  ip rule show | grep -q "fwmark 0x200000/0x200000 lookup \$WG_TABLE" || ip rule add fwmark 0x200000/0x200000 table "\$WG_TABLE" pref 1005 2>/dev/null || true
+  ip route add default dev wgclient table "\$WG_TABLE" 2>/dev/null || true
 fi
 FW
   sed -i "s#__VPS_IP__#\$SERVER_ENDPOINT#g" /etc/firewall.user
   sed -i "s#__UDP_PROXY_ENABLED__#\$UDP_PROXY_ENABLED#g" /etc/firewall.user
   sed -i "s#__WG_UDPICMP_ENABLED__#\$WG_UDPICMP_ENABLED#g" /etc/firewall.user
+  sed -i "s#__FORCE_WG_LIST__#\$FORCE_WG_LIST#g" /etc/firewall.user
   chmod 700 /etc/firewall.user
 }
 
@@ -537,6 +605,7 @@ SUCCESS_THRESHOLD=2
 SOCKS_TIMEOUT=8
 SOCKS_URL=https://api.ipify.org
 LAN_IF=br-lan
+WG_TABLE=101
 
 log() {
   printf '%s %s\n' "\$(date '+%F %T')" "\$1" >> "\$LOG_FILE"
@@ -549,6 +618,29 @@ proxy_rules_present() {
 enable_proxy_rules() {
   /etc/firewall.user >/dev/null 2>&1 || true
   /etc/init.d/firewall restart >/dev/null 2>&1 || true
+}
+
+wg_policy_needed() {
+  iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -j WG_FORCE" && return 0
+  iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -p udp -j WG_UDPICMP" && return 0
+  iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i \$LAN_IF -p icmp -j WG_UDPICMP" && return 0
+  return 1
+}
+
+wg_policy_present() {
+  ip rule show | grep -q "fwmark 0x200000/0x200000 lookup \$WG_TABLE" || return 1
+  ip route show table "\$WG_TABLE" 2>/dev/null | grep -q "default dev wgclient" || return 1
+}
+
+ensure_wg_policy() {
+  wg_policy_needed || return 0
+  wg_policy_present && return 0
+  /etc/firewall.user >/dev/null 2>&1 || true
+  if wg_policy_present; then
+    log 'wg_policy_restore'
+  else
+    log 'wg_policy_missing'
+  fi
 }
 
 disable_proxy_rules() {
@@ -590,6 +682,8 @@ if [ \$((NOW - STARTED_AT)) -lt "\$GRACE_SECONDS" ]; then
   save_state_file
   exit 0
 fi
+
+ensure_wg_policy
 
 if health_ok; then
   FAIL_COUNT=0
@@ -647,21 +741,27 @@ xray_start_safe() {
 
 clear_transparent_rules() {
   iptables -t nat -D PREROUTING -i br-lan -p tcp -j XRAY 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i br-lan -j WG_FORCE 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i br-lan -p udp -j XRAY_MASK 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i br-lan -p udp -j WG_UDPICMP 2>/dev/null || true
   iptables -t mangle -D PREROUTING -i br-lan -p icmp -j WG_UDPICMP 2>/dev/null || true
   iptables -t nat -F XRAY 2>/dev/null || true
   iptables -t nat -X XRAY 2>/dev/null || true
+  iptables -t mangle -F WG_FORCE 2>/dev/null || true
+  iptables -t mangle -X WG_FORCE 2>/dev/null || true
   iptables -t mangle -F XRAY_MASK 2>/dev/null || true
   iptables -t mangle -X XRAY_MASK 2>/dev/null || true
   iptables -t mangle -F WG_UDPICMP 2>/dev/null || true
   iptables -t mangle -X WG_UDPICMP 2>/dev/null || true
-  ip rule del fwmark 1 table 100 2>/dev/null || true
-  ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null || true
+  while ip rule del fwmark 1 table 100 2>/dev/null; do :; done
+  while ip rule del fwmark 0x200000/0x200000 table 100 2>/dev/null; do :; done
+  while ip rule del fwmark 0x200000/0x200000 table 101 2>/dev/null; do :; done
   ip route flush table 100 2>/dev/null || true
+  ip route flush table 101 2>/dev/null || true
 }
 
 start_tunnel() {
+  ensure_wg_peer_allowed_ips
   xray_start_safe
   /etc/init.d/firewall restart >/dev/null 2>&1 || true
   echo "[OK] Tunnel avviato."
@@ -674,6 +774,7 @@ stop_tunnel() {
 }
 
 restart_tunnel() {
+  ensure_wg_peer_allowed_ips
   xray_start_safe
   /etc/init.d/firewall restart >/dev/null 2>&1 || true
   echo "[OK] Tunnel riavviato."
@@ -715,13 +816,96 @@ show_status() {
   else
     echo "transparent udp: OFF (direct)"
   fi
+  if [ -s "\$FORCE_WG_LIST" ]; then
+    echo "force wg targets:"
+    sed 's/^/  - /' "\$FORCE_WG_LIST"
+  else
+    echo "force wg targets: none"
+  fi
+  if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "-i br-lan -j WG_FORCE"; then
+    echo "force wg policy: ON"
+  else
+    echo "force wg policy: OFF"
+  fi
   if [ -x "\$WATCHDOG_INIT" ]; then
-    echo "watchdog: $(/etc/init.d/xray-watchdog status 2>/dev/null || echo unknown)"
+    echo "watchdog: \$(/etc/init.d/xray-watchdog status 2>/dev/null || echo unknown)"
   fi
   echo "server endpoint: \$SERVER_ENDPOINT"
   echo -n "socks test ip: "
   curl -sS --max-time 12 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org || echo "failed"
   echo
+}
+
+normalize_force_target() {
+  local raw ip prefix
+  raw="\$(printf '%s' "\$1" | tr -d '[:space:]')"
+  [ -n "\$raw" ] || return 1
+  case "\$raw" in
+    */*) ip="\${raw%/*}"; prefix="\${raw#*/}" ;;
+    *) ip="\$raw"; prefix="32" ;;
+  esac
+  if [ "\$ip" = "\$SERVER_ENDPOINT" ]; then
+    echo "[ERRORE] Non forzare l'IP della VPS su WireGuard: romperesti il tunnel."
+    return 1
+  fi
+  if printf '%s %s\n' "\$ip" "\$prefix" | awk '
+    {
+      if (split(\$1, o, ".") != 4) exit 1
+      for (i = 1; i <= 4; i++) {
+        if (o[i] !~ /^[0-9]+$/ || o[i] < 0 || o[i] > 255) exit 1
+      }
+      if (\$2 !~ /^[0-9]+$/ || \$2 < 0 || \$2 > 32) exit 1
+    }'; then
+    printf '%s/%s\n' "\$ip" "\$prefix"
+    return 0
+  fi
+  return 1
+}
+
+list_force_wg_targets() {
+  echo
+  echo "=== DESTINAZIONI SEMPRE VIA WIREGUARD ==="
+  if [ -s "\$FORCE_WG_LIST" ]; then
+    nl -w 2 -s ') ' "\$FORCE_WG_LIST"
+  else
+    echo "Nessuna destinazione configurata."
+  fi
+}
+
+add_force_wg_target() {
+  local raw target
+  printf "IP o subnet da forzare su WireGuard (es. 8.8.8.8 o 1.2.3.0/24): "
+  read -r raw
+  target="\$(normalize_force_target "\$raw")" || { echo "[ERRORE] IP/subnet non valido."; return; }
+  mkdir -p "\$STATE_DIR"
+  touch "\$FORCE_WG_LIST"
+  if grep -Fxq "\$target" "\$FORCE_WG_LIST"; then
+    echo "[INFO] Gia presente: \$target"
+    return
+  fi
+  echo "\$target" >> "\$FORCE_WG_LIST"
+  write_firewall_user
+  /etc/init.d/firewall restart >/dev/null 2>&1 || true
+  echo "[OK] \$target passa sempre da WireGuard."
+}
+
+remove_force_wg_target() {
+  local raw target tmp
+  list_force_wg_targets
+  [ -s "\$FORCE_WG_LIST" ] || return
+  printf "IP o subnet da rimuovere: "
+  read -r raw
+  target="\$(normalize_force_target "\$raw")" || { echo "[ERRORE] IP/subnet non valido."; return; }
+  if ! grep -Fxq "\$target" "\$FORCE_WG_LIST"; then
+    echo "[INFO] Non presente: \$target"
+    return
+  fi
+  tmp="\$FORCE_WG_LIST.tmp.\$\$"
+  grep -Fxv "\$target" "\$FORCE_WG_LIST" > "\$tmp" || true
+  mv "\$tmp" "\$FORCE_WG_LIST"
+  write_firewall_user
+  /etc/init.d/firewall restart >/dev/null 2>&1 || true
+  echo "[OK] Rimossa: \$target"
 }
 
 install_mode() {
@@ -740,6 +924,7 @@ install_mode() {
   opkg install xray-core xray-geodata ca-bundle curl
   write_xray_config
   configure_xray_uci
+  ensure_wg_peer_allowed_ips
   write_firewall_user
   write_watchdog_files
   /usr/bin/xray run -test -config /etc/xray/config.json
@@ -788,10 +973,13 @@ control_panel() {
     echo "3) Stop tunnel"
     echo "4) Restart tunnel"
     echo "5) Toggle tunnel on/off"
-    echo "6) Cleanup totale (rimuovi tutto)"
-    echo "7) Reinstall/configura da zero"
-    echo "8) Esci"
-    printf "Seleziona [1-8]: "
+    echo "6) Lista destinazioni sempre via WireGuard"
+    echo "7) Aggiungi destinazione sempre via WireGuard"
+    echo "8) Rimuovi destinazione sempre via WireGuard"
+    echo "9) Cleanup totale (rimuovi tutto)"
+    echo "10) Reinstall/configura da zero"
+    echo "11) Esci"
+    printf "Seleziona [1-11]: "
     read -r opt
     case "\$opt" in
       1) show_status ;;
@@ -799,9 +987,12 @@ control_panel() {
       3) stop_tunnel ;;
       4) restart_tunnel ;;
       5) toggle_tunnel ;;
-      6) cleanup_mode ;;
-      7) install_mode ;;
-      8) exit 0 ;;
+      6) list_force_wg_targets ;;
+      7) add_force_wg_target ;;
+      8) remove_force_wg_target ;;
+      9) cleanup_mode ;;
+      10) install_mode ;;
+      11) exit 0 ;;
       *) echo "Opzione non valida." ;;
     esac
   done
